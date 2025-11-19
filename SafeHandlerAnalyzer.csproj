@@ -1,0 +1,21 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <PublishAot>true</PublishAot>
+    <PackAsTool>true</PackAsTool>
+    <UserSecretsId>SafeHandlerAnalyzer-ee1f5f4b008dcc1fe825e4f049e5469d62b72361cb4642cc000110305260201b</UserSecretsId>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Dumpify" Version="0.6.6" />
+    <PackageReference Include="Microsoft.Diagnostics.Runtime" Version="3.1.512801" />
+    <PackageReference Include="Microsoft.Extensions.Logging" Version="10.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="10.0.0" />
+    <PackageReference Include="System.CommandLine" Version="2.0.0" />
+  </ItemGroup>
+
+</Project>
