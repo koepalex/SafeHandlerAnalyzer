@@ -1,4 +1,5 @@
 
+using System.Collections.Immutable;
 using System.CommandLine;
 using Microsoft.Extensions.Logging;
 
@@ -31,6 +32,14 @@ public class SettingsLoader
                 Required = false,
             };
 
+        var gcRootOption = new Option<string?>(
+            name: "-gct",
+            aliases: ["--gcroottypes"])
+            {
+                Description = "Comma separated string of SafeHandle types, that should generate gc root files",
+                Required = false,
+            };
+
         var rootCommand = new RootCommand("Attach to process or read core dump")
         {
             pidOption,
@@ -42,6 +51,7 @@ public class SettingsLoader
         {
             ProcessId = parseResult.GetValue<int?>(pidOption),
             DumpPath = parseResult.GetValue<string?>(dumpOption),
+            GcRootTypes = parseResult.GetValue<string?>(gcRootOption)?.Split(',')?.ToImmutableList(),
         };
 
         if (settings.ProcessId is null && settings.DumpPath is null)
@@ -58,4 +68,5 @@ internal record Settings
 {
     internal int? ProcessId { get; set; }
     internal string? DumpPath { get; set; }
+    internal IEnumerable<string>? GcRootTypes { get; set; }
 }

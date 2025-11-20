@@ -11,7 +11,9 @@
             "program": "${workspaceFolder}/bin/Debug/net10.0/SafeHandlerAnalyzer.dll",
             "args": [                
                 "--dump",
-                "/mnt/s/tmp/bmw/dumps/07.13/core_20251118_061039"
+                "/mnt/s/tmp/bmw/dumps/07.13/core_20251118_061039",
+                "--gcroottypes",
+                "SafeX509Handle"
             ],
             "postDebugTask": "dotnet: build"
         }
