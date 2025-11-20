@@ -3,6 +3,7 @@ using System.Threading.Tasks;
 using System;
 using Microsoft.Diagnostics.Runtime;
 using SafeHandleAnalyzer.Configuration;
+using SafeHandleAnalyzer;
 using Microsoft.Extensions.Logging;
 using Dumpify;
 using System.Runtime.CompilerServices;
@@ -16,6 +17,28 @@ var logger = loggerFactory.CreateLogger("SafeHandlerAnalyzer");
 
 var settingsLoader = new SettingsLoader(loggerFactory.CreateLogger<SettingsLoader>());
 var settings = await settingsLoader.LoadArguments(args).ConfigureAwait(false);
+
+// Generate cache filename based on dump path or PID
+string cacheFilePath;
+if (settings.DumpPath is not null)
+{
+    // Use dump file name as base for cache file
+    var dumpFileName = Path.GetFileNameWithoutExtension(settings.DumpPath);
+    cacheFilePath = Path.Combine(Path.GetDirectoryName(settings.DumpPath) ?? ".", $"{dumpFileName}_analysis_cache.json");
+}
+else if (settings.ProcessId is not null)
+{
+    // Use PID as base for cache file
+    cacheFilePath = $"pid_{settings.ProcessId}_analysis_cache.json";
+}
+else
+{
+    cacheFilePath = "analysis_cache.json";
+}
+
+// Initialize cache manager and load existing cache
+var cacheManager = new AnalysisCacheManager(cacheFilePath, logger);
+cacheManager.Load();
 
 DataTarget? dataTarget = null;
 
@@ -56,6 +79,7 @@ IEnumerable<ClrObject> finalizableObjects = runtime.Heap.EnumerateFinalizableObj
 logger.LogInformation("Finalizer queue loaded");
 
 var safeHandleStatistics = new Dictionary<string, int>();
+var gcRootAnalysisResults = new List<GCRootAnalysisResult>();
 
 foreach(var finalizableObject in finalizableObjects)
 {
@@ -104,6 +128,9 @@ foreach(var finalizableObject in finalizableObjects)
             else if (finalizableObject.Type?.Name?.StartsWith("Microsoft.Win32.SafeHandles.SafeX509StoreCtxHandle") ?? false)
             {
             }
+            else if (finalizableObject.Type?.Name?.StartsWith("Microsoft.Win32.SafeHandles.SafeMemoryMappedViewHandle") ?? false)
+            {
+            }
             else
             {
                 finalizableObject.Type?.Name?.Dump();
@@ -111,7 +138,26 @@ foreach(var finalizableObject in finalizableObjects)
 
             if (settings.GcRootTypes != null && settings.GcRootTypes.Any(t => finalizableObject.Type?.Name?.EndsWith(t) ?? false))
             {
-                AnalyzeGCRoots(runtime, finalizableObject, logger);
+                // Check if this instance was already analyzed
+                if (cacheManager.IsAnalyzed(finalizableObject.Address))
+                {
+                    var cachedInfo = cacheManager.GetCachedInfo(finalizableObject.Address);
+                    logger.LogDebug($"Skipping already analyzed instance {finalizableObject.Type?.Name} @ {finalizableObject.Address:x} (cached: {cachedInfo?.RootPathCount} root(s))");
+                    continue;
+                }
+
+                var analysisResult = AnalyzeGCRoots(runtime, finalizableObject, logger);
+                if (analysisResult != null)
+                {
+                    gcRootAnalysisResults.Add(analysisResult);
+                    // Add to cache and save immediately for safe interrupt/resume
+                    cacheManager.AddAnalysis(
+                        analysisResult.ObjectAddress, 
+                        analysisResult.TypeName, 
+                        analysisResult.RootPaths.Count
+                    );
+                    cacheManager.Save();
+                }
             }
         }
     }
@@ -129,100 +175,101 @@ foreach (var kvp in safeHandleStatistics.OrderByDescending(x => x.Value))
 }
 logger.LogInformation("============================\n");
 
+// Export GC root analysis results to files
+if (gcRootAnalysisResults.Count > 0)
+{
+    logger.LogInformation($"Exporting {gcRootAnalysisResults.Count} GC root analysis result(s)...");
+    var exporter = new FileBasedGcRootExporter(logger);
+    exporter.ExportAll(gcRootAnalysisResults);
+    logger.LogInformation("GC root analysis export completed");
+}
+
+// Final save of the cache with verbose logging
+cacheManager.Save(verbose: true);
+
 runtime?.Dispose();
 dataTarget?.Dispose();
 
 logger.LogInformation("SafeHandlerAnalyzer stopped");
 
-static void AnalyzeGCRoots(ClrRuntime runtime, ClrObject finalizableObject, ILogger logger)
+static GCRootAnalysisResult? AnalyzeGCRoots(ClrRuntime runtime, ClrObject finalizableObject, ILogger logger)
 {
     if (!finalizableObject.IsValid)
     {
-        return;
+        return null;
     }
 
     try
     {
         logger.LogDebug($"Analyzing GC roots for {finalizableObject.Type?.Name} @ {finalizableObject.Address:x}");
         
-        // Create folder structure based on type name
         string typeName = finalizableObject.Type?.Name ?? "Unknown";
-        string sanitizedTypeName = string.Join("_", typeName.Split(Path.GetInvalidFileNameChars()));
-        string outputFolder = Path.Combine(Environment.CurrentDirectory, "GCRoots", sanitizedTypeName);
-        Directory.CreateDirectory(outputFolder);
+        var rootPaths = new List<GCRootPath>();
         
-        // Create file for this object using its address as filename
-        string fileName = $"{finalizableObject.Address:x16}.txt";
-        string filePath = Path.Combine(outputFolder, fileName);
+        GCRoot gcroot = new GCRoot(runtime.Heap, new ulong[] { finalizableObject.Address });
+        int pathCount = 0;
         
-        using (StreamWriter writer = new StreamWriter(filePath))
+        foreach ((ClrRoot root, GCRoot.ChainLink path) in gcroot.EnumerateRootPaths())
         {
-            writer.WriteLine($"GC Root Analysis for {typeName}");
-            writer.WriteLine($"Object Address: 0x{finalizableObject.Address:x}");
-            writer.WriteLine($"Analysis Date: {DateTime.Now}");
-            writer.WriteLine(new string('=', 80));
-            writer.WriteLine();
+            pathCount++;
+            var chain = new List<GCRootChainLink>();
+            bool hasCircularDependency = false;
+            bool maxDepthReached = false;
             
-            GCRoot gcroot = new GCRoot(runtime.Heap, new ulong[] { finalizableObject.Address });
-            int pathCount = 0;
+            var current = path;
+            int depth = 0;
+            const int maxDepth = 1000; // Safety limit to prevent infinite loops
+            var visitedAddresses = new HashSet<ulong>();
             
-            foreach ((ClrRoot root, GCRoot.ChainLink path) in gcroot.EnumerateRootPaths())
+            while (current != null)
             {
-                pathCount++;
-                string rootInfo = $"GC Root path #{pathCount}: {root.RootKind} @ 0x{root.Address:x}";
-                writer.WriteLine(rootInfo);
-                
-                var current = path;
-                int depth = 0;
-                const int maxDepth = 1000; // Safety limit to prevent infinite loops
-                var visitedAddresses = new HashSet<ulong>();
-                
-                while (current != null)
+                // Check for circular dependency
+                if (!visitedAddresses.Add(current.Object))
                 {
-                    // Check for circular dependency
-                    if (!visitedAddresses.Add(current.Object))
-                    {
-                        string circularMsg = $"    [{depth}] Circular dependency detected at 0x{current.Object:x}";
-                        logger.LogWarning(circularMsg);
-                        writer.WriteLine(circularMsg);
-                        break;
-                    }
-                    
-                    // Check for maximum depth
-                    if (depth >= maxDepth)
-                    {
-                        string maxDepthMsg = $"    [{depth}] Maximum depth reached, stopping traversal";
-                        logger.LogWarning(maxDepthMsg);
-                        writer.WriteLine(maxDepthMsg);
-                        break;
-                    }
-                    
-                    ClrObject obj = runtime.Heap.GetObject(current.Object);
-                    string objInfo = $"    --> [{depth}] {obj.Type?.Name ?? "Unknown"} @ 0x{current.Object:x}";
-                    writer.WriteLine(objInfo);
-                    current = current.Next;
-                    depth++;
+                    logger.LogWarning($"Circular dependency detected at 0x{current.Object:x}");
+                    hasCircularDependency = true;
+                    break;
                 }
                 
-                writer.WriteLine();
+                // Check for maximum depth
+                if (depth >= maxDepth)
+                {
+                    logger.LogWarning($"Maximum depth reached, stopping traversal");
+                    maxDepthReached = true;
+                    break;
+                }
+                
+                ClrObject obj = runtime.Heap.GetObject(current.Object);
+                chain.Add(new GCRootChainLink(
+                    Address: current.Object,
+                    TypeName: obj.Type?.Name ?? "Unknown",
+                    Depth: depth
+                ));
+                
+                current = current.Next;
+                depth++;
             }
             
-            if (pathCount == 0)
-            {
-                string orphanMsg = $"No GC root paths found for 0x{finalizableObject.Address:x} (orphaned object?)";
-                logger.LogWarning($"  {orphanMsg}");
-                writer.WriteLine(orphanMsg);
-            }
-            else
-            {
-                writer.WriteLine($"Total GC root paths found: {pathCount}");
-            }
+            rootPaths.Add(new GCRootPath(
+                RootKind: root.RootKind,
+                RootAddress: root.Address,
+                PathNumber: pathCount,
+                Chain: chain,
+                HasCircularDependency: hasCircularDependency,
+                MaxDepthReached: maxDepthReached
+            ));
         }
         
-        logger.LogInformation($"  GC root analysis written to: {filePath}");
+        return new GCRootAnalysisResult(
+            TypeName: typeName,
+            ObjectAddress: finalizableObject.Address,
+            AnalysisDate: DateTime.Now,
+            RootPaths: rootPaths
+        );
     }
     catch (Exception ex)
     {
         logger.LogError(ex, $"Error analyzing GC roots for {finalizableObject.Address:x}");
+        return null;
     }
 }

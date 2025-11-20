@@ -43,7 +43,8 @@ public class SettingsLoader
         var rootCommand = new RootCommand("Attach to process or read core dump")
         {
             pidOption,
-            dumpOption
+            dumpOption,
+            gcRootOption,
         };
     
         var parseResult = rootCommand.Parse(args);
