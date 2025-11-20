@@ -6,6 +6,7 @@ using SafeHandleAnalyzer.Configuration;
 using Microsoft.Extensions.Logging;
 using Dumpify;
 using System.Runtime.CompilerServices;
+using System.Net;
 
 // https://github.com/microsoft/clrmd/blob/main/src/Samples/GCRoot/GCRootDemo.cs
 
@@ -54,60 +55,140 @@ logger.LogInformation("Loading Finalizable objects");
 IEnumerable<ClrObject> finalizableObjects = runtime.Heap.EnumerateFinalizableObjects();
 logger.LogInformation("Finalizer queue loaded");
 
+var safeHandleStatistics = new Dictionary<string, int>();
+
 foreach(var finalizableObject in finalizableObjects)
 {
-    if (finalizableObject.Type?.Name?.StartsWith("Microsoft.Win32.SafeHandles") ?? false)
+    try
     {
-        if (finalizableObject.Type.Name == "Microsoft.Win32.SafeHandles.SafeFileHandle")
+        if (finalizableObject.Type?.Name?.StartsWith("Microsoft.Win32.SafeHandles") ?? false)
         {
-            ClrInstanceField? pathField = finalizableObject.Type.GetFieldByName("_path");
+            safeHandleStatistics.TryGetValue(finalizableObject.Type.Name, out int count);
+            safeHandleStatistics[finalizableObject.Type.Name] = count + 1;
 
-            if (pathField != null)
+            if (finalizableObject.Type.Name == "Microsoft.Win32.SafeHandles.SafeFileHandle")
             {
-                var path = pathField.ReadString(finalizableObject, false);
-                logger.LogInformation($"Active File handle for {path}");
+                ClrInstanceField? pathField = finalizableObject.Type.GetFieldByName("_path");
+
+                if (pathField != null)
+                {
+                    var path = pathField.ReadString(finalizableObject, false);
+                    logger.LogInformation($"Active File handle for {path}");
+                }
+                
+                AnalyzeGCRoots(runtime, finalizableObject, logger);
+            }
+            else if (finalizableObject.Type?.Name?.StartsWith("Microsoft.Win32.SafeHandles.SafeMemoryMappedFileHandle") ?? false)
+            {
+                AnalyzeGCRoots(runtime, finalizableObject, logger);
+            }
+            else if (finalizableObject.Type?.Name?.StartsWith("Microsoft.Win32.SafeHandles.SafeX509StackHandle") ?? false)
+            {
+                AnalyzeGCRoots(runtime, finalizableObject, logger);
+            }
+            else if (finalizableObject.Type?.Name?.StartsWith("Microsoft.Win32.SafeHandles.SafeX509Handle") ?? false)
+            {
+                AnalyzeGCRoots(runtime, finalizableObject, logger);
+            }
+            else if (finalizableObject.Type?.Name?.StartsWith("Microsoft.Win32.SafeHandles.SafeWaitHandle") ?? false)
+            {
+                AnalyzeGCRoots(runtime, finalizableObject, logger);
+            }
+            else if (finalizableObject.Type?.Name?.StartsWith("Microsoft.Win32.SafeHandles.SafeX509StoreHandle") ?? false)
+            {
+                AnalyzeGCRoots(runtime, finalizableObject, logger);
+            }
+            else if (finalizableObject.Type?.Name?.StartsWith("Microsoft.Win32.SafeHandles.SafeHmacCtxHandle") ?? false)
+            {
+                AnalyzeGCRoots(runtime, finalizableObject, logger);
+            }
+            else if (finalizableObject.Type?.Name?.StartsWith("Microsoft.Win32.SafeHandles.SafeEvpCipherCtxHandle") ?? false)
+            {
+                AnalyzeGCRoots(runtime, finalizableObject, logger);
+            }
+            else if (finalizableObject.Type?.Name?.StartsWith("Microsoft.Win32.SafeHandles.SafeX509StoreCtxHandle") ?? false)
+            {
+                AnalyzeGCRoots(runtime, finalizableObject, logger);
+            }
+            else
+            {
+                finalizableObject.Type.Name.Dump();
             }
         }
-        else if (finalizableObject.Type?.Name?.StartsWith("Microsoft.Win32.SafeHandles.SafeMemoryMappedFileHandle") ?? false)
-        {
-            
-        }
-        else if (finalizableObject.Type?.Name?.StartsWith("Microsoft.Win32.SafeHandles.SafeX509StackHandle") ?? false)
-        {
-            
-        }
-        else if (finalizableObject.Type?.Name?.StartsWith("Microsoft.Win32.SafeHandles.SafeX509Handle") ?? false)
-        {
-            
-        }
-        else if (finalizableObject.Type?.Name?.StartsWith("Microsoft.Win32.SafeHandles.SafeWaitHandle") ?? false)
-        {
-            
-        }
-        else if (finalizableObject.Type?.Name?.StartsWith("Microsoft.Win32.SafeHandles.SafeX509StoreHandle") ?? false)
-        {
-            
-        }
-        else if (finalizableObject.Type?.Name?.StartsWith("Microsoft.Win32.SafeHandles.SafeX509StoreHandle") ?? false)
-        {
-            
-        }
-        else if (finalizableObject.Type?.Name?.StartsWith("Microsoft.Win32.SafeHandles.SafeHmacCtxHandle") ?? false)
-        {
-            
-        }
-        else if (finalizableObject.Type?.Name?.StartsWith("Microsoft.Win32.SafeHandles.SafeEvpCipherCtxHandle") ?? false)
-        {
-            
-        }
-        else
-        {
-            finalizableObject.Type.Name.Dump();
-        }
+    }
+    catch (Exception e)
+    {
+        logger.LogError(e.ToString());    
     }
 }
+
+logger.LogInformation("\n=== SafeHandle Statistics ===");
+logger.LogInformation($"Total SafeHandle types found: {safeHandleStatistics.Count}");
+foreach (var kvp in safeHandleStatistics.OrderByDescending(x => x.Value))
+{
+    logger.LogInformation($"  {kvp.Key}: {kvp.Value} instance(s)");
+}
+logger.LogInformation("============================\n");
 
 runtime?.Dispose();
 dataTarget?.Dispose();
 
 logger.LogInformation("SafeHandlerAnalyzer stopped");
+
+static void AnalyzeGCRoots(ClrRuntime runtime, ClrObject finalizableObject, ILogger logger)
+{
+    if (!finalizableObject.IsValid)
+    {
+        return;
+    }
+
+    try
+    {
+        logger.LogDebug($"Analyzing GC roots for {finalizableObject.Type?.Name} @ {finalizableObject.Address:x}");
+        
+        GCRoot gcroot = new GCRoot(runtime.Heap, new ulong[] { finalizableObject.Address });
+        int pathCount = 0;
+        
+        foreach ((ClrRoot root, GCRoot.ChainLink path) in gcroot.EnumerateRootPaths())
+        {
+            pathCount++;
+            logger.LogInformation($"  GC Root path #{pathCount}: {root.RootKind} @ {root.Address:x}");
+            
+            var current = path;
+            int depth = 0;
+            const int maxDepth = 1000; // Safety limit to prevent infinite loops
+            var visitedAddresses = new HashSet<ulong>();
+            
+            while (current != null)
+            {
+                // Check for circular dependency
+                if (!visitedAddresses.Add(current.Object))
+                {
+                    logger.LogWarning($"    [{depth}] Circular dependency detected at {current.Object:x}");
+                    break;
+                }
+                
+                // Check for maximum depth
+                if (depth >= maxDepth)
+                {
+                    logger.LogWarning($"    [{depth}] Maximum depth reached, stopping traversal");
+                    break;
+                }
+                
+                ClrObject obj = runtime.Heap.GetObject(current.Object);
+                logger.LogInformation($"    [{depth}] {obj.Type?.Name ?? "Unknown"} @ {current.Object:x}");
+                current = current.Next;
+                depth++;
+            }
+        }
+        
+        if (pathCount == 0)
+        {
+            logger.LogWarning($"  No GC root paths found for {finalizableObject.Address:x} (orphaned object?)");
+        }
+    }
+    catch (Exception ex)
+    {
+        logger.LogError(ex, $"Error analyzing GC roots for {finalizableObject.Address:x}");
+    }
+}
