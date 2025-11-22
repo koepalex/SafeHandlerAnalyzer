@@ -9,7 +9,7 @@ class FileBasedGcRootExporter
         _logger = logger;
     }
 
-    public void Export(GCRootAnalysisResult result)
+    public string? Export(GCRootAnalysisResult result)
     {
         try
         {
@@ -67,18 +67,26 @@ class FileBasedGcRootExporter
             }
             
             _logger.LogInformation($"  GC root analysis written to: {filePath}");
+            return filePath;
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, $"Error exporting GC root analysis for {result.ObjectAddress:x}");
+            return null;
         }
     }
 
-    public void ExportAll(IEnumerable<GCRootAnalysisResult> results)
+    public List<string> ExportAll(IEnumerable<GCRootAnalysisResult> results)
     {
+        var exportedFiles = new List<string>();
         foreach (var result in results)
         {
-            Export(result);
+            var filePath = Export(result);
+            if (filePath != null)
+            {
+                exportedFiles.Add(filePath);
+            }
         }
+        return exportedFiles;
     }
 }

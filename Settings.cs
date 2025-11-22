@@ -40,11 +40,20 @@ public class SettingsLoader
                 Required = false,
             };
 
+        var gcRootImageOption = new Option<bool>(
+            name: "-gci",
+            aliases: ["--gcrootimage"])
+            {
+                Description = "Generate an SVG image showing all GC root graphs overlayed",
+                Required = false,
+            };
+
         var rootCommand = new RootCommand("Attach to process or read core dump")
         {
             pidOption,
             dumpOption,
             gcRootOption,
+            gcRootImageOption,
         };
     
         var parseResult = rootCommand.Parse(args);
@@ -53,6 +62,7 @@ public class SettingsLoader
             ProcessId = parseResult.GetValue<int?>(pidOption),
             DumpPath = parseResult.GetValue<string?>(dumpOption),
             GcRootTypes = parseResult.GetValue<string?>(gcRootOption)?.Split(',')?.ToImmutableList(),
+            GenerateGcRootImage = parseResult.GetValue<bool>(gcRootImageOption),
         };
 
         if (settings.ProcessId is null && settings.DumpPath is null)
@@ -70,4 +80,5 @@ internal record Settings
     internal int? ProcessId { get; set; }
     internal string? DumpPath { get; set; }
     internal IEnumerable<string>? GcRootTypes { get; set; }
+    internal bool GenerateGcRootImage { get; set; }
 }

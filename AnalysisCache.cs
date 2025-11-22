@@ -1,5 +1,6 @@
 
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using Microsoft.Extensions.Logging;
 
 namespace SafeHandleAnalyzer;
@@ -11,12 +12,14 @@ namespace SafeHandleAnalyzer;
 /// <param name="TypeName">The full type name of the object</param>
 /// <param name="RootPathCount">Number of GC root paths found for this object</param>
 /// <param name="AnalysisDate">When the analysis was performed</param>
+/// <param name="ExportedFilePaths">List of file paths where the analysis results were exported (optional)</param>
 record AnalysisCache
 (
     ulong ObjectAddress,
     string TypeName,
     int RootPathCount,
-    DateTime AnalysisDate
+    DateTime AnalysisDate,
+    List<string>? ExportedFilePaths = null
 );
 
 /// <summary>
@@ -26,6 +29,17 @@ record AnalysisCacheData
 (
     Dictionary<ulong, AnalysisCache> AnalyzedInstances
 );
+
+/// <summary>
+/// JSON source generation context for AOT compatibility
+/// </summary>
+[JsonSourceGenerationOptions(WriteIndented = true)]
+[JsonSerializable(typeof(AnalysisCacheData))]
+[JsonSerializable(typeof(Dictionary<ulong, AnalysisCache>))]
+[JsonSerializable(typeof(AnalysisCache))]
+internal partial class AnalysisCacheJsonContext : JsonSerializerContext
+{
+}
 
 /// <summary>
 /// Manages loading and saving of analysis cache to disk
@@ -57,7 +71,7 @@ class AnalysisCacheManager
         try
         {
             var json = File.ReadAllText(_cacheFilePath);
-            var cacheData = JsonSerializer.Deserialize<AnalysisCacheData>(json);
+            var cacheData = JsonSerializer.Deserialize(json, AnalysisCacheJsonContext.Default.AnalysisCacheData);
             
             if (cacheData?.AnalyzedInstances != null)
             {
@@ -91,13 +105,14 @@ class AnalysisCacheManager
     /// <summary>
     /// Adds a new analysis result to the cache
     /// </summary>
-    public void AddAnalysis(ulong objectAddress, string typeName, int rootPathCount)
+    public void AddAnalysis(ulong objectAddress, string typeName, int rootPathCount, List<string>? exportedFilePaths = null)
     {
         _cache[objectAddress] = new AnalysisCache(
             ObjectAddress: objectAddress,
             TypeName: typeName,
             RootPathCount: rootPathCount,
-            AnalysisDate: DateTime.Now
+            AnalysisDate: DateTime.Now,
+            ExportedFilePaths: exportedFilePaths
         );
     }
 
@@ -110,11 +125,7 @@ class AnalysisCacheManager
         try
         {
             var cacheData = new AnalysisCacheData(_cache);
-            var options = new JsonSerializerOptions 
-            { 
-                WriteIndented = true 
-            };
-            var json = JsonSerializer.Serialize(cacheData, options);
+            var json = JsonSerializer.Serialize(cacheData, AnalysisCacheJsonContext.Default.AnalysisCacheData);
             
             // Atomic write: write to temp file first, then replace
             var tempFilePath = _cacheFilePath + ".tmp";

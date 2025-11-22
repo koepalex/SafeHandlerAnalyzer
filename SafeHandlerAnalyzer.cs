@@ -138,25 +138,43 @@ foreach(var finalizableObject in finalizableObjects)
 
             if (settings.GcRootTypes != null && settings.GcRootTypes.Any(t => finalizableObject.Type?.Name?.EndsWith(t) ?? false))
             {
-                // Check if this instance was already analyzed
-                if (cacheManager.IsAnalyzed(finalizableObject.Address))
+                // When GcRootTypes is specified, we always want to export results
+                // So we analyze even if cached, to ensure exports are generated
+                bool alreadyCached = cacheManager.IsAnalyzed(finalizableObject.Address);
+                
+                if (alreadyCached)
                 {
                     var cachedInfo = cacheManager.GetCachedInfo(finalizableObject.Address);
-                    logger.LogDebug($"Skipping already analyzed instance {finalizableObject.Type?.Name} @ {finalizableObject.Address:x} (cached: {cachedInfo?.RootPathCount} root(s))");
-                    continue;
+                    logger.LogDebug($"Re-analyzing cached instance {finalizableObject.Type?.Name} @ {finalizableObject.Address:x} for export (cached: {cachedInfo?.RootPathCount} root(s))");
                 }
 
                 var analysisResult = AnalyzeGCRoots(runtime, finalizableObject, logger);
                 if (analysisResult != null)
                 {
+                    // Export immediately after analysis
+                    var exportedFiles = new List<string>();
+                    
+                    // Always export to individual text file
+                    var fileExporter = new FileBasedGcRootExporter(logger);
+                    var textFilePath = fileExporter.Export(analysisResult);
+                    if (textFilePath != null)
+                    {
+                        exportedFiles.Add(textFilePath);
+                    }
+                    
                     gcRootAnalysisResults.Add(analysisResult);
-                    // Add to cache and save immediately for safe interrupt/resume
-                    cacheManager.AddAnalysis(
-                        analysisResult.ObjectAddress, 
-                        analysisResult.TypeName, 
-                        analysisResult.RootPaths.Count
-                    );
-                    cacheManager.Save();
+                    
+                    // Add to cache if not already there, including exported file paths
+                    if (!alreadyCached)
+                    {
+                        cacheManager.AddAnalysis(
+                            analysisResult.ObjectAddress, 
+                            analysisResult.TypeName, 
+                            analysisResult.RootPaths.Count,
+                            exportedFiles.Count > 0 ? exportedFiles : null
+                        );
+                        cacheManager.Save();
+                    }
                 }
             }
         }
@@ -175,13 +193,18 @@ foreach (var kvp in safeHandleStatistics.OrderByDescending(x => x.Value))
 }
 logger.LogInformation("============================\n");
 
-// Export GC root analysis results to files
-if (gcRootAnalysisResults.Count > 0)
+// Generate SVG overlay graph if requested (individual files already exported during analysis)
+if (gcRootAnalysisResults.Count > 0 && settings.GenerateGcRootImage)
 {
-    logger.LogInformation($"Exporting {gcRootAnalysisResults.Count} GC root analysis result(s)...");
-    var exporter = new FileBasedGcRootExporter(logger);
-    exporter.ExportAll(gcRootAnalysisResults);
-    logger.LogInformation("GC root analysis export completed");
+    logger.LogInformation($"Generating SVG overlay graph for {gcRootAnalysisResults.Count} GC root analysis result(s)...");
+    
+    var svgExporter = new SvgGcRootExporter(logger);
+    var svgFilePath = svgExporter.ExportOverlayedGraph(gcRootAnalysisResults);
+    
+    if (svgFilePath != null)
+    {
+        logger.LogInformation($"SVG overlay graph generated at: {svgFilePath}");
+    }
 }
 
 // Final save of the cache with verbose logging
