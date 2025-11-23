@@ -17,22 +17,26 @@ class SvgGcRootExporter
         _logger = logger;
     }
 
-    public string? ExportOverlayedGraph(IEnumerable<GCRootAnalysisResult> results, string outputPath = "gc_roots_overlay.svg")
+    public string? ExportOverlayedGraph(GCRootAnalysisResult result)
     {
         try
         {
+            string sanitizedTypeName = string.Join("_", result.TypeName.Split(Path.GetInvalidFileNameChars()));
+            string outputFolder = Path.Combine(Environment.CurrentDirectory, "GCRoots", sanitizedTypeName);
+            Directory.CreateDirectory(outputFolder);
+            
+            // Create file for this object using its address as filename
+            string fileName = $"{result.ObjectAddress:x16}.svg";
+            string filePath = Path.Combine(outputFolder, fileName);
             _logger.LogInformation($"Generating overlayed GC root graph SVG...");
 
             // Build a unified graph structure
             var graphNodes = new Dictionary<ulong, GraphNode>();
             var graphEdges = new List<GraphEdge>();
 
-            foreach (var result in results)
+            foreach (var rootPath in result.RootPaths)
             {
-                foreach (var rootPath in result.RootPaths)
-                {
-                    ProcessRootPath(rootPath, result.TypeName, graphNodes, graphEdges);
-                }
+                ProcessRootPath(rootPath, result.TypeName, graphNodes, graphEdges);
             }
 
             if (graphNodes.Count == 0)
@@ -41,14 +45,13 @@ class SvgGcRootExporter
                 return null;
             }
 
-            // Layout the graph
-            var layout = CalculateLayout(graphNodes, graphEdges);
+            // Depth 0 will represent the leaf (finalizable) object; increasing depth moves towards GC roots
+            var layout = CalculateLayout(graphNodes, graphEdges, result.ObjectAddress);
 
             // Generate SVG
-            GenerateSvg(layout, graphNodes, graphEdges, outputPath);
+            GenerateSvg(layout, graphNodes, graphEdges, filePath, result.ObjectAddress);
 
-            _logger.LogInformation($"GC root overlay graph saved to: {outputPath}");
-            return outputPath;
+            return filePath;
         }
         catch (Exception ex)
         {
@@ -59,61 +62,81 @@ class SvgGcRootExporter
 
     private void ProcessRootPath(GCRootPath rootPath, string targetTypeName, Dictionary<ulong, GraphNode> nodes, List<GraphEdge> edges)
     {
-        // Add root node
-        if (!nodes.ContainsKey(rootPath.RootAddress))
+        // Assemble full path sequence root -> ... -> leaf
+        var sequence = new List<(ulong Address, string TypeName, bool IsRoot)>
         {
-            nodes[rootPath.RootAddress] = new GraphNode(
-                Address: rootPath.RootAddress,
-                TypeName: $"[{rootPath.RootKind}]",
-                IsRoot: true,
+            (rootPath.RootAddress, $"[{rootPath.RootKind}]", true)
+        };
+        foreach (var link in rootPath.Chain)
+        {
+            sequence.Add((link.Address, link.TypeName, false));
+        }
+
+        if (sequence.Count == 0)
+        {
+            return;
+        }
+
+        // Leaf assumed to be last element (finalizable object)
+        var leaf = sequence[^1];
+        ulong leafAddress = leaf.Address;
+
+        if (!nodes.ContainsKey(leafAddress))
+        {
+            nodes[leafAddress] = new GraphNode(
+                Address: leafAddress,
+                TypeName: targetTypeName,
+                IsRoot: false,
                 Depth: 0,
                 ReferenceCount: 0
             );
         }
-        nodes[rootPath.RootAddress] = nodes[rootPath.RootAddress] with { ReferenceCount = nodes[rootPath.RootAddress].ReferenceCount + 1 };
+        else if (nodes[leafAddress].Depth > 0)
+        {
+            nodes[leafAddress] = nodes[leafAddress] with { Depth = 0 }; // ensure leaf stays depth 0
+        }
+        nodes[leafAddress] = nodes[leafAddress] with { ReferenceCount = nodes[leafAddress].ReferenceCount + 1 };
 
-        ulong previousAddress = rootPath.RootAddress;
+        ulong previousAddress = leafAddress; // previous in traversal towards roots (child reference)
+        int depth = 1; // parents of leaf start at depth 1
 
-        // Process chain links
-        int depth = 1;
-        foreach (var link in rootPath.Chain)
+        // Walk backwards towards root
+        for (int i = sequence.Count - 2; i >= 0; i--)
         {
             if (depth > _maxDepthToVisualize)
-                break;
-
-            if (!nodes.ContainsKey(link.Address))
             {
-                nodes[link.Address] = new GraphNode(
-                    Address: link.Address,
-                    TypeName: link.TypeName,
-                    IsRoot: false,
+                break;
+            }
+
+            var current = sequence[i];
+            if (!nodes.ContainsKey(current.Address))
+            {
+                nodes[current.Address] = new GraphNode(
+                    Address: current.Address,
+                    TypeName: current.TypeName,
+                    IsRoot: current.IsRoot,
                     Depth: depth,
                     ReferenceCount: 0
                 );
             }
-            else
+            else if (depth < nodes[current.Address].Depth)
             {
-                // Update depth to minimum (closer to root)
-                if (depth < nodes[link.Address].Depth)
-                {
-                    nodes[link.Address] = nodes[link.Address] with { Depth = depth };
-                }
+                nodes[current.Address] = nodes[current.Address] with { Depth = depth };
             }
-            nodes[link.Address] = nodes[link.Address] with { ReferenceCount = nodes[link.Address].ReferenceCount + 1 };
+            nodes[current.Address] = nodes[current.Address] with { ReferenceCount = nodes[current.Address].ReferenceCount + 1 };
 
-            // Add edge if not already present
-            var edge = new GraphEdge(previousAddress, link.Address);
+            // Edge from parent (current) to child (previousAddress)
+            var edge = new GraphEdge(current.Address, previousAddress);
             if (!edges.Any(e => e.From == edge.From && e.To == edge.To))
             {
                 edges.Add(edge);
             }
-
-            previousAddress = link.Address;
+            previousAddress = current.Address;
             depth++;
         }
     }
 
-    private Dictionary<ulong, NodePosition> CalculateLayout(Dictionary<ulong, GraphNode> nodes, List<GraphEdge> edges)
+    private Dictionary<ulong, NodePosition> CalculateLayout(Dictionary<ulong, GraphNode> nodes, List<GraphEdge> edges, ulong analyzedObjectAddress)
     {
         var layout = new Dictionary<ulong, NodePosition>();
         
@@ -147,7 +170,7 @@ class SvgGcRootExporter
         return layout;
     }
 
-    private void GenerateSvg(Dictionary<ulong, NodePosition> layout, Dictionary<ulong, GraphNode> nodes, List<GraphEdge> edges, string outputPath)
+    private void GenerateSvg(Dictionary<ulong, NodePosition> layout, Dictionary<ulong, GraphNode> nodes, List<GraphEdge> edges, string outputPath, ulong analyzedObjectAddress)
     {
         // Calculate SVG dimensions
         int maxX = layout.Values.Max(p => p.X) + _nodeWidth + 100;
@@ -162,12 +185,15 @@ class SvgGcRootExporter
         svg.AppendLine("  <style>");
         svg.AppendLine("    .node { fill: #e3f2fd; stroke: #1976d2; stroke-width: 2; }");
         svg.AppendLine("    .root-node { fill: #ffebee; stroke: #c62828; stroke-width: 2; }");
+        svg.AppendLine("    .target-node { fill: #fff3e0; stroke: #ef6c00; stroke-width: 3; }");
         svg.AppendLine("    .node-text { font-family: monospace; font-size: 12px; fill: #000; }");
         svg.AppendLine("    .node-address { font-family: monospace; font-size: 10px; fill: #666; }");
         svg.AppendLine("    .edge { stroke: #90caf9; stroke-width: 1.5; fill: none; opacity: 0.6; }");
         svg.AppendLine("    .edge-hover { stroke: #1976d2; stroke-width: 2.5; }");
         svg.AppendLine("    .count-badge { fill: #ff9800; stroke: #e65100; stroke-width: 1; }");
         svg.AppendLine("    .count-text { font-family: sans-serif; font-size: 11px; fill: #fff; font-weight: bold; }");
+        svg.AppendLine("    .copy-flash { animation: flash 1s ease-in-out; }");
+        svg.AppendLine("    @keyframes flash { 0% { stroke-width:3; } 50% { stroke-width:6; } 100% { stroke-width:3; } }");
         svg.AppendLine("  </style>");
         svg.AppendLine("</defs>");
 
@@ -216,25 +242,28 @@ class SvgGcRootExporter
             if (layout.TryGetValue(node.Address, out var pos))
             {
                 string nodeClass = node.IsRoot ? "root-node" : "node";
-                
-                // Draw node rectangle
-                svg.AppendLine($"  <rect x=\"{pos.X}\" y=\"{pos.Y}\" width=\"{_nodeWidth}\" height=\"{_nodeHeight}\" class=\"{nodeClass}\" rx=\"5\"/>");
-                
-                // Draw type name (truncate if too long)
-                string displayName = TruncateText(node.TypeName, 22);
-                svg.AppendLine($"  <text x=\"{pos.X + _nodeWidth / 2}\" y=\"{pos.Y + 18}\" class=\"node-text\" text-anchor=\"middle\">{EscapeXml(displayName)}</text>");
-                
-                // Draw address
-                svg.AppendLine($"  <text x=\"{pos.X + _nodeWidth / 2}\" y=\"{pos.Y + 32}\" class=\"node-address\" text-anchor=\"middle\">0x{node.Address:x}</text>");
+                if (node.Address == analyzedObjectAddress)
+                {
+                    nodeClass = "target-node";
+                }
+
+                string fullName = node.TypeName;
+                string shortName = ShortDisplayName(fullName);
+
+                svg.AppendLine($"  <g class=\"node-group\" data-address=\"0x{node.Address:x}\" data-fullname=\"{EscapeXml(fullName)}\" tabindex=\"0\">\n    <title>{EscapeXml(fullName)} (0x{node.Address:x})</title>");
+                svg.AppendLine($"    <rect x=\"{pos.X}\" y=\"{pos.Y}\" width=\"{_nodeWidth}\" height=\"{_nodeHeight}\" class=\"{nodeClass}\" rx=\"5\"/>");
+                svg.AppendLine($"    <text x=\"{pos.X + _nodeWidth / 2}\" y=\"{pos.Y + 18}\" class=\"node-text\" text-anchor=\"middle\">{EscapeXml(shortName)}</text>");
+                svg.AppendLine($"    <text x=\"{pos.X + _nodeWidth / 2}\" y=\"{pos.Y + 32}\" class=\"node-address\" text-anchor=\"middle\">0x{node.Address:x}</text>");
                 
                 // Draw reference count badge if > 1
                 if (node.ReferenceCount > 1)
                 {
                     int badgeX = pos.X + _nodeWidth - 15;
                     int badgeY = pos.Y - 8;
-                    svg.AppendLine($"  <circle cx=\"{badgeX}\" cy=\"{badgeY}\" r=\"12\" class=\"count-badge\"/>");
-                    svg.AppendLine($"  <text x=\"{badgeX}\" y=\"{badgeY + 4}\" class=\"count-text\" text-anchor=\"middle\">{node.ReferenceCount}</text>");
+                    svg.AppendLine($"    <circle cx=\"{badgeX}\" cy=\"{badgeY}\" r=\"12\" class=\"count-badge\"/>");
+                    svg.AppendLine($"    <text x=\"{badgeX}\" y=\"{badgeY + 4}\" class=\"count-text\" text-anchor=\"middle\">{node.ReferenceCount}</text>");
                 }
+                svg.AppendLine("  </g>");
             }
         }
         svg.AppendLine("</g>");
@@ -256,6 +285,11 @@ class SvgGcRootExporter
         // Add title
         svg.AppendLine($"<text x=\"{maxX / 2}\" y=\"30\" class=\"node-text\" text-anchor=\"middle\" font-size=\"18\" font-weight=\"bold\">GC Root Overlay Graph ({nodes.Count} nodes, {edges.Count} edges)</text>");
 
+        // Add copy script for double-click
+        svg.AppendLine("<script><![CDATA[");
+        svg.AppendLine("(function(){\n  function copy(text){ if(navigator.clipboard){ navigator.clipboard.writeText(text).catch(()=>{}); } else { var ta=document.createElement('textarea'); ta.value=text; document.body.appendChild(ta); ta.select(); try{document.execCommand('copy');}catch(e){} document.body.removeChild(ta);} }\n  var groups=document.querySelectorAll('.node-group');\n  groups.forEach(function(g){\n    g.addEventListener('dblclick', function(){\n      var full=g.getAttribute('data-fullname');\n      var addr=g.getAttribute('data-address');\n      var payload=full+' '+addr;\n      copy(payload);\n      var rect=g.querySelector('rect');\n      if(rect){\n        rect.classList.add('copy-flash');\n        setTimeout(function(){rect.classList.remove('copy-flash');},1000);\n      }\n    });\n  });\n})();");
+        svg.AppendLine("]]></script>");
+
         svg.AppendLine("</svg>");
 
         File.WriteAllText(outputPath, svg.ToString());
@@ -272,6 +306,18 @@ class SvgGcRootExporter
             return "..." + text.Substring(lastDot);
 
         return text.Substring(0, maxLength - 3) + "...";
+    }
+
+    private string ShortDisplayName(string typeName)
+    {
+        if (string.IsNullOrEmpty(typeName)) return typeName;
+        // Root kind labels like [Strong] should remain untouched
+        if (typeName.StartsWith("[") && typeName.EndsWith("]")) return typeName;
+        var lastDot = typeName.LastIndexOf('.');
+        if (lastDot < 0) return TruncateText(typeName, 28);
+        var tail = typeName.Substring(lastDot + 1);
+        var display = ".." + tail;
+        return TruncateText(display, 28);
     }
 
     private string EscapeXml(string text)

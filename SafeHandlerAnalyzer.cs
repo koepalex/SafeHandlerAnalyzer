@@ -60,7 +60,7 @@ if (dataTarget == null)
     logger.LogError("Can't load DataTarget - Stopping");
     return;
 }
-    
+
 logger.LogInformation("Creating diagnostics runtime");
 ClrRuntime? runtime;
 try
@@ -81,7 +81,7 @@ logger.LogInformation("Finalizer queue loaded");
 var safeHandleStatistics = new Dictionary<string, int>();
 var gcRootAnalysisResults = new List<GCRootAnalysisResult>();
 
-foreach(var finalizableObject in finalizableObjects)
+foreach (var finalizableObject in finalizableObjects)
 {
     try
     {
@@ -102,7 +102,7 @@ foreach(var finalizableObject in finalizableObjects)
                         logger.LogInformation($"Active File handle for {path}");
                     }
                 }
-                
+
             }
             else if (finalizableObject.Type?.Name?.StartsWith("Microsoft.Win32.SafeHandles.SafeMemoryMappedFileHandle") ?? false)
             {
@@ -135,13 +135,10 @@ foreach(var finalizableObject in finalizableObjects)
             {
                 finalizableObject.Type?.Name?.Dump();
             }
-
             if (settings.GcRootTypes != null && settings.GcRootTypes.Any(t => finalizableObject.Type?.Name?.EndsWith(t) ?? false))
             {
-                // When GcRootTypes is specified, we always want to export results
-                // So we analyze even if cached, to ensure exports are generated
+                // Always analyze/export after each SafeHandle so application can be safely stopped anytime.
                 bool alreadyCached = cacheManager.IsAnalyzed(finalizableObject.Address);
-                
                 if (alreadyCached)
                 {
                     var cachedInfo = cacheManager.GetCachedInfo(finalizableObject.Address);
@@ -151,37 +148,60 @@ foreach(var finalizableObject in finalizableObjects)
                 var analysisResult = AnalyzeGCRoots(runtime, finalizableObject, logger);
                 if (analysisResult != null)
                 {
-                    // Export immediately after analysis
                     var exportedFiles = new List<string>();
-                    
-                    // Always export to individual text file
+
+                    // Text export
                     var fileExporter = new FileBasedGcRootExporter(logger);
                     var textFilePath = fileExporter.Export(analysisResult);
                     if (textFilePath != null)
                     {
+                        logger.LogInformation($"Text file generated at: {textFilePath}");
                         exportedFiles.Add(textFilePath);
                     }
-                    
+
                     gcRootAnalysisResults.Add(analysisResult);
-                    
-                    // Add to cache if not already there, including exported file paths
+
+                    // SVG export (respect existing setting toggle)
+                    if (settings.GenerateGcRootImage)
+                    {
+                        logger.LogInformation($"Generating SVG overlay graph for {finalizableObject.Address} GC root analysis result(s)...");
+                        var svgExporter = new SvgGcRootExporter(logger);
+                        var svgFilePath = svgExporter.ExportOverlayedGraph(analysisResult);
+                        if (svgFilePath != null)
+                        {
+                            logger.LogInformation($"SVG overlay graph generated at: {svgFilePath}");
+                            exportedFiles.Add(svgFilePath);
+                        }
+                    }
+
+                    // Update cache each time (ensure persistence on early exit)
                     if (!alreadyCached)
                     {
                         cacheManager.AddAnalysis(
-                            analysisResult.ObjectAddress, 
-                            analysisResult.TypeName, 
+                            analysisResult.ObjectAddress,
+                            analysisResult.TypeName,
                             analysisResult.RootPaths.Count,
                             exportedFiles.Count > 0 ? exportedFiles : null
                         );
-                        cacheManager.Save();
                     }
+                    else if (exportedFiles.Count > 0)
+                    {
+                        // Optionally update cached exports if new ones generated
+                        cacheManager.AddAnalysis(
+                            analysisResult.ObjectAddress,
+                            analysisResult.TypeName,
+                            analysisResult.RootPaths.Count,
+                            exportedFiles
+                        );
+                    }
+                    cacheManager.Save();
                 }
             }
         }
     }
     catch (Exception e)
     {
-        logger.LogError(e.ToString());    
+        logger.LogError(e.ToString());
     }
 }
 
@@ -192,20 +212,6 @@ foreach (var kvp in safeHandleStatistics.OrderByDescending(x => x.Value))
     logger.LogInformation($"  {kvp.Key}: {kvp.Value} instance(s)");
 }
 logger.LogInformation("============================\n");
-
-// Generate SVG overlay graph if requested (individual files already exported during analysis)
-if (gcRootAnalysisResults.Count > 0 && settings.GenerateGcRootImage)
-{
-    logger.LogInformation($"Generating SVG overlay graph for {gcRootAnalysisResults.Count} GC root analysis result(s)...");
-    
-    var svgExporter = new SvgGcRootExporter(logger);
-    var svgFilePath = svgExporter.ExportOverlayedGraph(gcRootAnalysisResults);
-    
-    if (svgFilePath != null)
-    {
-        logger.LogInformation($"SVG overlay graph generated at: {svgFilePath}");
-    }
-}
 
 // Final save of the cache with verbose logging
 cacheManager.Save(verbose: true);
@@ -225,25 +231,25 @@ static GCRootAnalysisResult? AnalyzeGCRoots(ClrRuntime runtime, ClrObject finali
     try
     {
         logger.LogDebug($"Analyzing GC roots for {finalizableObject.Type?.Name} @ {finalizableObject.Address:x}");
-        
+
         string typeName = finalizableObject.Type?.Name ?? "Unknown";
         var rootPaths = new List<GCRootPath>();
-        
+
         GCRoot gcroot = new GCRoot(runtime.Heap, new ulong[] { finalizableObject.Address });
         int pathCount = 0;
-        
+
         foreach ((ClrRoot root, GCRoot.ChainLink path) in gcroot.EnumerateRootPaths())
         {
             pathCount++;
             var chain = new List<GCRootChainLink>();
             bool hasCircularDependency = false;
             bool maxDepthReached = false;
-            
+
             var current = path;
             int depth = 0;
             const int maxDepth = 1000; // Safety limit to prevent infinite loops
             var visitedAddresses = new HashSet<ulong>();
-            
+
             while (current != null)
             {
                 // Check for circular dependency
@@ -253,7 +259,7 @@ static GCRootAnalysisResult? AnalyzeGCRoots(ClrRuntime runtime, ClrObject finali
                     hasCircularDependency = true;
                     break;
                 }
-                
+
                 // Check for maximum depth
                 if (depth >= maxDepth)
                 {
@@ -261,18 +267,18 @@ static GCRootAnalysisResult? AnalyzeGCRoots(ClrRuntime runtime, ClrObject finali
                     maxDepthReached = true;
                     break;
                 }
-                
+
                 ClrObject obj = runtime.Heap.GetObject(current.Object);
                 chain.Add(new GCRootChainLink(
                     Address: current.Object,
                     TypeName: obj.Type?.Name ?? "Unknown",
                     Depth: depth
                 ));
-                
+
                 current = current.Next;
                 depth++;
             }
-            
+
             rootPaths.Add(new GCRootPath(
                 RootKind: root.RootKind,
                 RootAddress: root.Address,
@@ -282,7 +288,7 @@ static GCRootAnalysisResult? AnalyzeGCRoots(ClrRuntime runtime, ClrObject finali
                 MaxDepthReached: maxDepthReached
             ));
         }
-        
+
         return new GCRootAnalysisResult(
             TypeName: typeName,
             ObjectAddress: finalizableObject.Address,
